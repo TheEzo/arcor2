@@ -12,6 +12,7 @@ from arcor2.object_types.utils import settings_from_params
 from arcor2_arserver import globals as glob
 from arcor2_arserver import notifications as notif
 from arcor2_arserver.clients import persistent_storage as storage
+from arcor2_arserver.lock import Lock
 from arcor2_arserver.object_types.data import ObjectTypeData
 from arcor2_arserver.objects_actions import get_object_types
 from arcor2_arserver_data.events.common import ShowMainScreen
@@ -199,6 +200,7 @@ async def open_scene(scene_id: str) -> None:
     await get_object_types()
     asyncio.ensure_future(scene_srv.delete_all_collisions())
     glob.SCENE = UpdateableCachedScene(await storage.get_scene(scene_id))
+    glob.LOCK = Lock(scene=glob.SCENE)
 
     try:
         for obj in glob.SCENE.objects:

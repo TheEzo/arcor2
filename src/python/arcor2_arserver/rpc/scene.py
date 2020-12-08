@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional, Set
 
 import quaternion
-from arcor2_calibration_data import client as calibration
 from websockets.server import WebSocketServerProtocol as WsClient
 
 from arcor2 import helpers as hlp
@@ -17,8 +16,9 @@ from arcor2.exceptions import Arcor2Exception
 from arcor2_arserver import globals as glob
 from arcor2_arserver import notifications as notif
 from arcor2_arserver.clients import persistent_storage as storage
-from arcor2_arserver.decorators import no_project, no_scene, scene_needed
+from arcor2_arserver.decorators import no_project, no_scene, scene_needed, write_lock
 from arcor2_arserver.helpers import unique_name
+from arcor2_arserver.lock import Lock
 from arcor2_arserver.objects_actions import get_object_types
 from arcor2_arserver.project import (
     associated_projects,
@@ -43,6 +43,7 @@ from arcor2_arserver.scene import (
 )
 from arcor2_arserver_data import events as sevts
 from arcor2_arserver_data import rpc as srpc
+from arcor2_calibration_data import client as calibration
 
 OBJECTS_WITH_UPDATED_POSE: Set[str] = set()
 
@@ -95,6 +96,8 @@ async def new_scene_cb(req: srpc.s.NewScene.Request, ui: WsClient) -> None:
 
     await get_object_types()  # TODO not ideal, may take quite long time
     glob.SCENE = UpdateableCachedScene(common.Scene(common.uid(), req.args.name, desc=req.args.desc))
+    glob.LOCK = Lock(scene=glob.SCENE)
+
     asyncio.ensure_future(notif.broadcast_event(sevts.s.OpenScene(sevts.s.OpenScene.Data(glob.SCENE.scene))))
     asyncio.ensure_future(scene_srv.delete_all_collisions())  # just for sure
     return None
@@ -390,6 +393,7 @@ async def update_object_pose_using_robot_cb(req: srpc.o.UpdateObjectPoseUsingRob
 
 @scene_needed
 @no_project
+@write_lock
 async def update_object_pose_cb(req: srpc.s.UpdateObjectPose.Request, ui: WsClient) -> None:
 
     can_modify_scene()

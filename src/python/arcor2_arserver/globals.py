@@ -8,6 +8,7 @@ from arcor2.cached import UpdateableCachedProject, UpdateableCachedScene
 from arcor2.data import events
 from arcor2.logging import get_aiologger
 from arcor2.object_types.abstract import Generic
+from arcor2_arserver.lock import Lock
 from arcor2_arserver.object_types.data import ObjectTypeDict
 from arcor2_arserver_data.events.common import ShowMainScreen
 
@@ -40,3 +41,5 @@ RegisteredUiDict = DefaultDict[str, Set[WsClient]]
 
 ROBOT_JOINTS_REGISTERED_UIS: RegisteredUiDict = defaultdict(lambda: set())  # robot, UIs
 ROBOT_EEF_REGISTERED_UIS: RegisteredUiDict = defaultdict(lambda: set())  # robot, UIs
+
+LOCK: Optional[Lock] = None
