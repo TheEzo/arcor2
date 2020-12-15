@@ -1,7 +1,6 @@
 import functools
 from typing import Any, Callable, Coroutine, TypeVar, cast
 
-from arcor2.data.rpc.common import RPC
 from arcor2.exceptions import Arcor2Exception
 from arcor2_arserver import globals as glob
 
@@ -47,18 +46,5 @@ def project_needed(coro: F) -> F:
         if glob.PROJECT is None or not glob.PROJECT.id:
             raise Arcor2Exception("Project not opened or has invalid id.")
         return await coro(*args, **kwargs)
-
-    return cast(F, async_wrapper)
-
-
-def write_lock(coro: F) -> F:
-    @functools.wraps(coro)
-    async def async_wrapper(*args, **kwargs) -> Any:
-        rpc = next(arg for arg in args if isinstance(arg, RPC.Request))
-        if await glob.LOCK.lock_for_write(rpc.args.object_id, 'tbd', rpc.request):
-            ret = await coro(*args, **kwargs)
-            if await glob.LOCK.unlock_write(rpc.args.object_id, rpc.request):
-                return ret
-        raise Arcor2Exception("Update failed")
 
     return cast(F, async_wrapper)

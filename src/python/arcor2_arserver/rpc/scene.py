@@ -16,9 +16,8 @@ from arcor2.exceptions import Arcor2Exception
 from arcor2_arserver import globals as glob
 from arcor2_arserver import notifications as notif
 from arcor2_arserver.clients import persistent_storage as storage
-from arcor2_arserver.decorators import no_project, no_scene, scene_needed, write_lock
-from arcor2_arserver.helpers import unique_name
-from arcor2_arserver.lock import Lock
+from arcor2_arserver.decorators import no_project, no_scene, scene_needed
+from arcor2_arserver.helpers import unique_name, ctx_read_lock, ctx_write_lock
 from arcor2_arserver.objects_actions import get_object_types
 from arcor2_arserver.project import (
     associated_projects,
@@ -94,13 +93,16 @@ async def new_scene_cb(req: srpc.s.NewScene.Request, ui: WsClient) -> None:
     if req.dry_run:
         return None
 
-    await get_object_types()  # TODO not ideal, may take quite long time
-    glob.SCENE = UpdateableCachedScene(common.Scene(common.uid(), req.args.name, desc=req.args.desc))
-    glob.LOCK = Lock(scene=glob.SCENE)
+    async with ctx_write_lock(glob.LOCK.SCENE_NAME, glob.LOCK.SERVER_NAME):
+        assert glob.SCENE is None
 
-    asyncio.ensure_future(notif.broadcast_event(sevts.s.OpenScene(sevts.s.OpenScene.Data(glob.SCENE.scene))))
-    asyncio.ensure_future(scene_srv.delete_all_collisions())  # just for sure
-    return None
+        await get_object_types()  # TODO not ideal, may take quite long time
+        glob.SCENE = UpdateableCachedScene(common.Scene(common.uid(), req.args.name, desc=req.args.desc))
+        glob.LOCK.scene = glob.SCENE
+
+        asyncio.ensure_future(notif.broadcast_event(sevts.s.OpenScene(sevts.s.OpenScene.Data(glob.SCENE.scene))))
+        asyncio.ensure_future(scene_srv.delete_all_collisions())  # just for sure
+        return None
 
 
 @scene_needed
@@ -113,6 +115,7 @@ async def close_scene_cb(req: srpc.s.CloseScene.Request, ui: WsClient) -> None:
     """
 
     assert glob.SCENE
+    assert glob.LOCK
 
     if not req.args.force and glob.SCENE.has_changes():
         raise Arcor2Exception("Scene has unsaved changes.")
@@ -122,10 +125,15 @@ async def close_scene_cb(req: srpc.s.CloseScene.Request, ui: WsClient) -> None:
     if req.dry_run:
         return None
 
-    scene_id = glob.SCENE.id
-    glob.SCENE = None
-    OBJECTS_WITH_UPDATED_POSE.clear()
-    asyncio.ensure_future(notify_scene_closed(scene_id))
+    async with glob.LOCK.get_lock() as lock:  # todo test it!
+        # todo check if anything locked
+        assert glob.SCENE
+
+        scene_id = glob.SCENE.id
+        glob.SCENE = None
+        glob.LOCK = None
+        OBJECTS_WITH_UPDATED_POSE.clear()
+        asyncio.ensure_future(notify_scene_closed(scene_id))
 
 
 @scene_needed
@@ -135,9 +143,11 @@ async def save_scene_cb(req: srpc.s.SaveScene.Request, ui: WsClient) -> None:
     assert glob.SCENE
     glob.SCENE.modified = await storage.update_scene(glob.SCENE.scene)
     asyncio.ensure_future(notif.broadcast_event(sevts.s.SceneSaved()))
-    for obj_id in OBJECTS_WITH_UPDATED_POSE:
-        asyncio.ensure_future(scene_object_pose_updated(glob.SCENE.id, obj_id))
-    OBJECTS_WITH_UPDATED_POSE.clear()
+    async with glob.LOCK.get_lock():
+        # todo check if anything locked
+        for obj_id in OBJECTS_WITH_UPDATED_POSE:
+            asyncio.ensure_future(scene_object_pose_updated(glob.SCENE.id, obj_id))
+        OBJECTS_WITH_UPDATED_POSE.clear()
     return None
 
 
@@ -147,7 +157,11 @@ async def open_scene_cb(req: srpc.s.OpenScene.Request, ui: WsClient) -> None:
     if glob.PACKAGE_STATE.state in PackageState.RUN_STATES:
         raise Arcor2Exception("Can't open scene while package runs.")
 
-    await open_scene(req.args.id)
+    async with glob.LOCK.get_lock():
+        assert not glob.SCENE
+
+        await open_scene(req.args.id)
+
     assert glob.SCENE
     assert glob.SCENE.int_modified is None
     assert not glob.SCENE.has_changes()
@@ -174,12 +188,13 @@ async def add_object_to_scene_cb(req: srpc.s.AddObjectToScene.Request, ui: WsCli
 
     can_modify_scene()
 
-    obj = common.SceneObject(common.uid(), req.args.name, req.args.type, req.args.pose, req.args.parameters)
+    async with ctx_read_lock(glob.SCENE.id, 'ui.owner'):
+        obj = common.SceneObject(common.uid(), req.args.name, req.args.type, req.args.pose, req.args.parameters)
 
-    await add_object_to_scene(obj, dry_run=req.dry_run)
+        await add_object_to_scene(obj, dry_run=req.dry_run)
 
-    if req.dry_run:
-        return None
+        if req.dry_run:
+            return None
 
     glob.SCENE.update_modified()
 
@@ -197,20 +212,21 @@ async def update_object_parameters_cb(req: srpc.s.UpdateObjectParameters.Request
 
     can_modify_scene()
 
-    obj = glob.SCENE.object(req.args.id)
+    async with ctx_write_lock(req.args.id):
+        obj = glob.SCENE.object(req.args.id)
 
-    if obj.type not in glob.OBJECT_TYPES:
-        raise Arcor2Exception("Unknown object type.")
+        if obj.type not in glob.OBJECT_TYPES:
+            raise Arcor2Exception("Unknown object type.")
 
-    obj_type = glob.OBJECT_TYPES[obj.type]
+        obj_type = glob.OBJECT_TYPES[obj.type]
 
-    check_object_parameters(obj_type, req.args.parameters)
+        check_object_parameters(obj_type, req.args.parameters)
 
-    if req.dry_run:
-        return None
+        if req.dry_run:
+            return None
 
-    obj.parameters = req.args.parameters
-    glob.SCENE.update_modified()
+        obj.parameters = req.args.parameters
+        glob.SCENE.update_modified()
 
     evt = sevts.s.SceneObjectChanged(obj)
     evt.change_type = Event.Type.UPDATE
@@ -393,14 +409,18 @@ async def update_object_pose_using_robot_cb(req: srpc.o.UpdateObjectPoseUsingRob
 
 @scene_needed
 @no_project
-@write_lock
 async def update_object_pose_cb(req: srpc.s.UpdateObjectPose.Request, ui: WsClient) -> None:
 
     can_modify_scene()
 
     assert glob.SCENE
+    assert glob.LOCK
+    assert glob.LOCK.is_write_locked(req.args.object_id)
 
     obj = glob.SCENE.object(req.args.object_id)
+
+    if not await glob.LOCK.is_write_locked(obj.id):
+        raise Arcor2Exception("Object not locked.")
 
     if not obj.pose:
         raise Arcor2Exception("Object without pose.")
@@ -426,6 +446,8 @@ async def update_object_pose_cb(req: srpc.s.UpdateObjectPose.Request, ui: WsClie
 async def rename_object_cb(req: srpc.s.RenameObject.Request, ui: WsClient) -> None:
 
     assert glob.SCENE
+    assert glob.LOCK
+    assert glob.LOCK.is_read_locked(req.args.id)
 
     target_obj = glob.SCENE.object(req.args.id)
 
@@ -442,7 +464,8 @@ async def rename_object_cb(req: srpc.s.RenameObject.Request, ui: WsClient) -> No
     if req.dry_run:
         return None
 
-    target_obj.name = req.args.new_name
+    async with ctx_write_lock(target_obj.id):
+        target_obj.name = req.args.new_name
 
     glob.SCENE.update_modified()
 
