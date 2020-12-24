@@ -15,7 +15,7 @@ def unique_name(name: str, existing_names: Set[str]) -> None:
 
 
 @asynccontextmanager
-async def ctx_write_lock(obj_ids: Union[str, List[str]], owner: str) -> AsyncGenerator[None, None]:
+async def ctx_write_lock(obj_ids: Union[str, List[str]], owner: str = LOCK.SERVER_NAME) -> AsyncGenerator[None, None]:
 
     if isinstance(obj_ids, int):
         obj_ids = [obj_ids]
@@ -36,8 +36,8 @@ async def ctx_read_lock(obj_ids: Union[str, List[str]], owner: str) -> AsyncGene
         if await LOCK.read_lock(obj_id, owner):
             locked.append(obj_id)
         else:
-            for obj_id in locked:
-                await LOCK.read_unlock(obj_id)
+            # for obj_id in locked: TODO
+            #     await LOCK.read_unlock(obj_id)
             raise Arcor2Exception("Locking failed")
     try:
         yield

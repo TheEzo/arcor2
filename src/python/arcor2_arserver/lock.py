@@ -112,6 +112,8 @@ class Lock:
 
         self._lock = asyncio.Lock()
         self._locked_objects: Dict[str, "Lock.LockedObject"] = {}
+        # obj_id: root_id TODO handle this as property?
+        self._used: Dict[str, str] = {}
 
     @property
     def scene(self):
@@ -180,7 +182,7 @@ class Lock:
 
         async with self._lock:
             lock_record = self._get_lock_record(root_id)
-            unlocked = lock_record.write_unlock()
+            unlocked = lock_record.write_unlock(obj_id)
 
             if unlocked and lock_record.is_empty():
                 del self._locked_objects[root_id]

@@ -249,11 +249,12 @@ async def scene_object_usage_request_cb(
     if not (any(obj.id == req.args.id for obj in glob.SCENE.objects)):
         raise Arcor2Exception("Unknown ID.")
 
-    resp = srpc.s.SceneObjectUsage.Response()
-    resp.data = set()
+    async with ctx_read_lock(req.args.id):
+        resp = srpc.s.SceneObjectUsage.Response()
+        resp.data = set()
 
-    async for project in projects_using_object(glob.SCENE.id, req.args.id):
-        resp.data.add(project.id)
+        async for project in projects_using_object(glob.SCENE.id, req.args.id):
+            resp.data.add(project.id)
 
     return resp
 
@@ -307,26 +308,27 @@ async def remove_from_scene_cb(req: srpc.s.RemoveFromScene.Request, ui: WsClient
 
     can_modify_scene()
 
-    if not req.args.force and {proj.name async for proj in projects_using_object(glob.SCENE.id, req.args.id)}:
-        raise Arcor2Exception("Can't remove object that is used in project(s).")
+    async with ctx_write_lock(req.args.id):
+        if not req.args.force and {proj.name async for proj in projects_using_object(glob.SCENE.id, req.args.id)}:
+            raise Arcor2Exception("Can't remove object that is used in project(s).")
 
-    if req.dry_run:
-        return None
+        if req.dry_run:
+            return None
 
-    if req.args.id not in glob.SCENE.object_ids:
-        raise Arcor2Exception("Unknown id.")
+        if req.args.id not in glob.SCENE.object_ids:
+            raise Arcor2Exception("Unknown id.")
 
-    obj = glob.SCENE.object(req.args.id)
-    glob.SCENE.delete_object(req.args.id)
+        obj = glob.SCENE.object(req.args.id)
+        glob.SCENE.delete_object(req.args.id)
 
-    if req.args.id in OBJECTS_WITH_UPDATED_POSE:
-        OBJECTS_WITH_UPDATED_POSE.remove(req.args.id)
+        if req.args.id in OBJECTS_WITH_UPDATED_POSE:
+            OBJECTS_WITH_UPDATED_POSE.remove(req.args.id)
 
-    evt = sevts.s.SceneObjectChanged(obj)
-    evt.change_type = Event.Type.REMOVE
-    asyncio.ensure_future(notif.broadcast_event(evt))
+        evt = sevts.s.SceneObjectChanged(obj)
+        evt.change_type = Event.Type.REMOVE
+        asyncio.ensure_future(notif.broadcast_event(evt))
 
-    asyncio.ensure_future(remove_object_references_from_projects(req.args.id))
+        asyncio.ensure_future(remove_object_references_from_projects(req.args.id))
     return None
 
 
@@ -477,17 +479,20 @@ async def rename_object_cb(req: srpc.s.RenameObject.Request, ui: WsClient) -> No
 
 async def rename_scene_cb(req: srpc.s.RenameScene.Request, ui: WsClient) -> None:
 
+    assert glob.LOCK.is_read_locked(req.args.id)
+
     unique_name(req.args.new_name, (await scene_names()))
 
     if req.dry_run:
         return None
 
-    async with managed_scene(req.args.id) as scene:
-        scene.name = req.args.new_name
+    async with ctx_write_lock(req.args.id):
+        async with managed_scene(req.args.id) as scene:
+            scene.name = req.args.new_name
 
-        evt = sevts.s.SceneChanged(scene.bare)
-        evt.change_type = Event.Type.UPDATE_BASE
-        asyncio.ensure_future(notif.broadcast_event(evt))
+            evt = sevts.s.SceneChanged(scene.bare)
+            evt.change_type = Event.Type.UPDATE_BASE
+            asyncio.ensure_future(notif.broadcast_event(evt))
     return None
 
 
@@ -536,13 +541,14 @@ async def update_scene_description_cb(req: srpc.s.UpdateSceneDescription.Request
 
 async def copy_scene_cb(req: srpc.s.CopyScene.Request, ui: WsClient) -> None:
 
-    # TODO check if target_name is unique
-    async with managed_scene(req.args.source_id, make_copy=True) as scene:
-        scene.name = req.args.target_name
+    async with ctx_write_lock(req.args.source_id, ''):
+        # TODO check if target_name is unique
+        async with managed_scene(req.args.source_id, make_copy=True) as scene:
+            scene.name = req.args.target_name
 
-        evt = sevts.s.SceneChanged(scene.bare)
-        evt.change_type = Event.Type.UPDATE_BASE
-        asyncio.ensure_future(notif.broadcast_event(evt))
+            evt = sevts.s.SceneChanged(scene.bare)
+            evt.change_type = Event.Type.UPDATE_BASE
+            asyncio.ensure_future(notif.broadcast_event(evt))
 
     return None
 
@@ -557,13 +563,16 @@ async def calibration_cb(req: srpc.c.Calibration.Request, ui: WsClient) -> srpc.
 
 async def start_scene_cb(req: srpc.s.StartScene.Request, ui: WsClient) -> None:
 
-    if get_scene_state() != sevts.s.SceneState.Data.StateEnum.Stopped:
-        raise Arcor2Exception("Scene not stopped.")
+    async with ctx_write_lock(glob.LOCK.SCENE_NAME):
+        assert not glob.SCENE
+        
+        if get_scene_state() != sevts.s.SceneState.Data.StateEnum.Stopped:
+            raise Arcor2Exception("Scene not stopped.")
 
-    if req.dry_run:
-        return
+        if req.dry_run:
+            return
 
-    asyncio.ensure_future(start_scene())
+        asyncio.ensure_future(start_scene())
 
 
 async def stop_scene_cb(req: srpc.s.StopScene.Request, ui: WsClient) -> None:
