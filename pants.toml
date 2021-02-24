@@ -1,10 +1,10 @@
 [GLOBAL]
-pants_version = "2.1.0rc1"
+pants_version = "2.3.0.dev3"
 colors = true
 
 
 plugins = [
-  "packaging==20.4",
+  "packaging==20.9",
 ]
 
 backend_packages.add = [
@@ -32,6 +32,7 @@ root_patterns = [
 interpreter_constraints = ["==3.8.*"]
 requirement_constraints = "3rdparty/constraints.txt"
 interpreter_search_paths = ["<PATH>", "/usr/bin/python3.8"]
+resolver_version = "pip-2020-resolver"
 
 [flake8]
 config = ".flake8"
@@ -45,9 +46,14 @@ extra_requirements.add = [
   "vulture"
 ]
 
+
 [mypy]
 config = "mypy.ini"
-version = "mypy==0.790"
+version = "mypy==0.800"
+# TODO enable this once numpy 1.21.0 is out
+# extra_requirements.add = [
+#  "numpy"
+#]
 
 [pytest]
 pytest_plugins.add = [
@@ -61,7 +67,7 @@ args = ["--count=3 -x"]
 timeout_default = 600
 
 [test]
-use_coverage = true
+use_coverage = false
 
 [black]
 config = "pyproject.toml"

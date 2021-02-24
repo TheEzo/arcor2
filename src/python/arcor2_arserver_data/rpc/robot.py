@@ -140,6 +140,7 @@ class MoveToPose(RPC):
             speed: float
             position: Optional[Position]
             orientation: Optional[Orientation]
+            safe: bool = True
 
         args: Args
 
@@ -176,6 +177,7 @@ class MoveToJoints(RPC):
             robot_id: str
             speed: float
             joints: List[Joint]
+            safe: bool = True
 
         args: Args
 
@@ -197,6 +199,7 @@ class MoveToActionPoint(RPC):
             end_effector_id: Optional[str] = None
             orientation_id: Optional[str] = None
             joints_id: Optional[str] = None
+            safe: bool = True
 
         args: Args
 
@@ -243,3 +246,41 @@ class ForwardKinematics(RPC):
     @dataclass
     class Response(RPC.Response):
         data: Optional[Pose] = None
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class CalibrateRobot(RPC):
+    @dataclass
+    class Request(RPC.Request):
+        @dataclass
+        class Args(JsonSchemaMixin):
+            robot_id: str
+            camera_id: Optional[str] = None
+            move_to_calibration_pose: bool = True
+
+        args: Args
+
+    @dataclass
+    class Response(RPC.Response):
+        pass
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class HandTeachingMode(RPC):
+    @dataclass
+    class Request(RPC.Request):
+        @dataclass
+        class Args(JsonSchemaMixin):
+            robot_id: str
+            enable: bool
+
+        args: Args
+        dry_run: bool = False
+
+    @dataclass
+    class Response(RPC.Response):
+        pass

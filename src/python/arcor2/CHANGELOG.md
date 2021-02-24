@@ -2,7 +2,30 @@
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
-## [0.10.0] - WIP
+## [0.11.1] - 2021-02-09
+
+### Fixed
+- `@action` decorator fixed.
+- `KeyError` was raised when `an` parameter was not given to an action.
+- This only happened in the "manual" script writing scenario and when `patch_object_actions` was used.
+
+## [0.11.0] - 2021-02-08
+
+### Changed
+- Explicit action parameters.
+  - `Resources` class now do not need to deal with parameters.
+  - Update of ObjectTypes (all actions now have the mandatory `an` parameter).
+- `CurrentAction` removed, `ActionState` divided into `ActionStateBefore` and `ActionStateAfter`.
+- New module with shared code for Flask-based apps.
+- Updates of 3rd party dependencies.
+- WS server now logs too long RPCs. 
+  - Max. duration could be configured using `ARCOR2_MAX_RPC_DURATION`.
+
+### Fixed
+- At a startup, the main script now checks if the scene is running before attempt to stop it.
+- `image_from_str` function fixed.
+
+## [0.10.0] - 2020-12-14
 
 ### Changed
 - `action` decorator now handles outputs of actions.
@@ -12,6 +35,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Parameter plugins slightly reworked, some new helper functions.
 - If a robot has URDF, it is zipped and uploaded to the Project service).
   - ...as a mesh file, which is workaround for missing storage of URDF models.
+- Scene service client updated to support version 0.4.0.
+- New built-in abstract ObjectType `Camera`.
+- Initial support for loading of URDF files.
+- Some first tests for parameter plugins were added.
 
 ## [0.9.2] - 2020-10-30
 

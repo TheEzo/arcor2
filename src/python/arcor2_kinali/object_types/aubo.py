@@ -5,8 +5,7 @@ from dataclasses_jsonschema import JsonSchemaMixin
 
 from arcor2 import DynamicParamTuple as DPT
 from arcor2 import rest
-from arcor2.data.common import ActionMetadata, Joint, Orientation, Pose, Position, ProjectRobotJoints
-from arcor2.parameter_plugins.relative_pose import RelativePose
+from arcor2.data.common import ActionMetadata, Joint, Orientation, Pose, Position, ProjectRobotJoints, RelativePose
 
 from .abstract_robot import AbstractRobot, MoveTypeEnum, lru_cache
 
@@ -33,11 +32,8 @@ class Aubo(AbstractRobot):
     _ABSTRACT = False
     urdf_package_name = "aubo.zip"
 
-    def move_to_pose(self, end_effector_id: str, target_pose: Pose, speed: float) -> None:
-        self.move(end_effector_id, target_pose, MoveTypeEnum.SIMPLE, speed, safe=True)
-
-    def move_to_joints(self, target_joints: List[Joint], speed: float) -> None:
-        self.set_joints(ProjectRobotJoints("", "", "", target_joints), MoveTypeEnum.SIMPLE, speed, safe=True)
+    def move_to_pose(self, end_effector_id: str, target_pose: Pose, speed: float, safe: bool = True) -> None:
+        self.move(end_effector_id, target_pose, MoveTypeEnum.SIMPLE, speed, safe=safe)
 
     # --- EndEffectors Controller --------------------------------------------------------------------------------------
 
@@ -56,6 +52,8 @@ class Aubo(AbstractRobot):
         speed: float = 0.5,
         acceleration: float = 0.5,
         safe: bool = True,
+        *,
+        an: Optional[str] = None,
     ) -> None:
         """Moves the robot's end-effector to a specific pose.
 
@@ -71,12 +69,9 @@ class Aubo(AbstractRobot):
         assert 0.0 <= speed <= 1.0
         assert 0.0 <= acceleration <= 1.0
 
-        if safe:
-            url = f"{self.settings.url}/endEffectors/{end_effector_id}/moveCollideLess"
-        else:
-            url = f"{self.settings.url}/endEffectors/{end_effector_id}/move"
+        url = f"{self.settings.url}/endEffectors/{end_effector_id}/move"
 
-        params = {"moveType": move_type.value, "speed": speed, "acceleration": acceleration}
+        params = {"moveType": move_type.value, "speed": speed, "acceleration": acceleration, "safe": safe}
 
         with self._move_lock:
             rest.call(rest.Method.PUT, url, body=pose, params=params, timeout=self.move_timeout)
@@ -90,6 +85,8 @@ class Aubo(AbstractRobot):
         speed: float = 0.5,
         acceleration: float = 0.5,
         safe: bool = True,
+        *,
+        an: Optional[str] = None,
     ) -> None:
         """Moves the robot's end-effector to a specific pose.
 
@@ -106,12 +103,9 @@ class Aubo(AbstractRobot):
         assert 0.0 <= speed <= 1.0
         assert 0.0 <= acceleration <= 1.0
 
-        if safe:
-            url = f"{self.settings.url}/endEffectors/{end_effector_id}/moveCollideLessRelative"
-        else:
-            url = f"{self.settings.url}/endEffectors/{end_effector_id}/moveRelative"
+        url = f"{self.settings.url}/endEffectors/{end_effector_id}/moveRelative"
 
-        params = {"moveType": move_type.value, "speed": speed, "acceleration": acceleration}
+        params = {"moveType": move_type.value, "speed": speed, "acceleration": acceleration, "safe": safe}
         body = MoveRelativeParameters(pose, rel_pose.position, rel_pose.orientation)
 
         with self._move_lock:
@@ -126,6 +120,8 @@ class Aubo(AbstractRobot):
         speed: float = 0.5,
         acceleration: float = 0.5,
         safe: bool = True,
+        *,
+        an: Optional[str] = None,
     ) -> None:
         """Moves the robot's end-effector relatively to specific joint values.
 
@@ -143,13 +139,10 @@ class Aubo(AbstractRobot):
         assert 0.0 <= speed <= 1.0
         assert 0.0 <= acceleration <= 1.0
 
-        if safe:
-            url = f"{self.settings.url}/endEffectors/{end_effector_id}/moveJointsCollideLessRelative"
-        else:
-            url = f"{self.settings.url}/endEffectors/{end_effector_id}/moveJointsRelative"
+        url = f"{self.settings.url}/endEffectors/{end_effector_id}/moveJointsRelative"
 
         body = MoveRelativeJointsParameters(joints.joints, rel_pose.position, rel_pose.orientation)
-        params = {"moveType": move_type.value, "speed": speed}
+        params = {"moveType": move_type.value, "speed": speed, "acceleration": acceleration, "safe": safe}
 
         with self._move_lock:
             rest.call(rest.Method.PUT, url, body=body, params=params, timeout=self.move_timeout)
@@ -224,13 +217,13 @@ class Aubo(AbstractRobot):
     def suctions(self) -> Set[str]:
         return set(rest.call(rest.Method.GET, f"{self.settings.url}/suctions", return_type=str))
 
-    def suck(self, suction_id: str) -> None:
+    def suck(self, suction_id: str, *, an: Optional[str] = None) -> None:
         rest.call(rest.Method.PUT, f"{self.settings.url}/suctions/{suction_id}/suck")
 
-    def release(self, suction_id: str) -> None:
+    def release(self, suction_id: str, *, an: Optional[str] = None) -> None:
         rest.call(rest.Method.PUT, f"{self.settings.url}/suctions/{suction_id}/release")
 
-    def is_item_attached(self, suction_id: str) -> bool:
+    def is_item_attached(self, suction_id: str, *, an: Optional[str] = None) -> bool:
         return rest.call(rest.Method.GET, f"{self.settings.url}/suctions/{suction_id}/attached", return_type=bool)
 
     move.__action__ = ActionMetadata(blocking=True)  # type: ignore

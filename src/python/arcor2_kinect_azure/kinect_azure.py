@@ -119,26 +119,36 @@ class KinectAzure:
 
         capture = self._capture()
 
-        if not np.any(capture.color):
+        if not capture.color:
             raise KinectAzureException("Color image not available.")
 
         self._bgra_to_rgba(capture.color)
         return Image.fromarray(capture.color, mode="RGBA")
 
-    def depth_image(self) -> Image.Image:
+    def _depth_image(self) -> np.ndarray:
 
         capture = self._capture()
 
-        if not np.any(capture.depth):
+        if capture.transformed_depth is None:
             raise KinectAzureException("Depth image not available.")
 
-        return Image.fromarray(capture.transformed_depth)
+        return capture.transformed_depth
+
+    def depth_image(self, averaged_frames: int = 1) -> Image.Image:
+
+        img = self._depth_image()
+        array = img.astype(np.float32)
+
+        for _ in range(averaged_frames):
+            array += self._depth_image().astype(np.float32)
+
+        return Image.fromarray((array / averaged_frames).astype(img.dtype))
 
     def sync_images(self) -> ColorAndDepthImage:
 
         capture = self._capture()
 
-        if not np.any(capture.color) or not np.any(capture.depth):
+        if not capture.color or not capture.depth:
             raise KinectAzureException("Color/depth image not available.")
 
         self._bgra_to_rgba(capture.color)

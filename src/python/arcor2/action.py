@@ -1,9 +1,11 @@
 import select
 import sys
 from functools import wraps
-from typing import Any, Callable, List, Optional, Type, TypeVar, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union, cast
 
-from arcor2.data.events import ActionState, Event, PackageState
+from arcor2.cached import CachedProject, CachedScene
+from arcor2.data.events import ActionStateAfter, ActionStateBefore, Event, PackageState
+from arcor2.exceptions import Arcor2Exception
 from arcor2.object_types.abstract import Generic
 from arcor2.object_types.utils import iterate_over_actions
 from arcor2.parameter_plugins.utils import plugin_from_instance
@@ -11,15 +13,25 @@ from arcor2.parameter_plugins.utils import plugin_from_instance
 HANDLE_ACTIONS = True
 
 
-def patch_object_actions(type_def: Type[Generic]) -> None:
+def get_action_name_to_id(scene: CachedScene, project: CachedProject, object_type: str) -> Dict[str, str]:
+    return {act.name: act.id for act in project.actions if scene.object(act.parse_type().obj_id).type == object_type}
+
+
+def patch_object_actions(type_def: Type[Generic], action_name_to_id: Optional[Dict[str, str]] = None) -> None:
     """Dynamically adds @action decorator to the methods with assigned
     ActionMetadata.
 
-    :param type_def:
+    :param type_def: Type to be patched.
+    :param action_name_to_id: Mapping from action names (`an` parameter) to action ids.
     :return:
     """
 
+    # we somehow need to make action name->id accessible within the @action decorator
+    if action_name_to_id is not None:
+        type_def.action_name_to_id = action_name_to_id  # type: ignore
+
     for method_name, method in iterate_over_actions(type_def):
+        # TODO avoid accidental double patching
         setattr(type_def, method_name, action(method))
 
 
@@ -96,33 +108,45 @@ def results_to_json(res: Any) -> Optional[List[str]]:
 
 def action(f: F) -> F:
     @wraps(f)
-    def wrapper(*args: Union[Generic, Any], **kwargs: Any) -> Any:
+    def wrapper(*args: Union[Generic, Any], an: Optional[str] = None, **kwargs: Any) -> Any:
 
-        # automagical overload for dictionary (allow to get rid of ** in script).
-        if len(args) == 2 and isinstance(args[1], dict) and not kwargs:
-            kwargs = args[1]
-            args = (args[0],)
+        action_args = args[1:]
+        action_id: Optional[str] = None
 
-        inst = args[0]
+        try:
+            action_id = args[0].action_name_to_id[an]  # type: ignore
+        except AttributeError:
+            # mapping from action name to id not provided, ActionState won't be sent
+            pass
+        except KeyError:
+            if an is None:
+                raise Arcor2Exception("Mapping from action name to id provided, but action name not set.")
+            raise Arcor2Exception(f"Mapping from action name to id is missing key {an}.")
 
         if not action.inside_composite and HANDLE_ACTIONS:  # type: ignore
-            print_event(ActionState(ActionState.Data(inst.id, f.__name__, ActionState.Data.StateEnum.BEFORE)))
+            if action_id:
+                print_event(
+                    ActionStateBefore(
+                        ActionStateBefore.Data(
+                            # TODO deal with kwargs parameters
+                            action_id,
+                            [plugin_from_instance(arg).value_to_json(arg) for arg in action_args],
+                        )
+                    )
+                )
             handle_action()
 
         if wrapper.__action__.composite:  # type: ignore # TODO and not step_into
             action.inside_composite = f  # type: ignore
 
-        res = f(*args, **kwargs)
+        res = f(*args, an=an, **kwargs)
 
         if action.inside_composite == f:  # type: ignore
             action.inside_composite = None  # type: ignore
 
         if not action.inside_composite and HANDLE_ACTIONS:  # type: ignore
-            print_event(
-                ActionState(
-                    ActionState.Data(inst.id, f.__name__, ActionState.Data.StateEnum.AFTER, results_to_json(res))
-                )
-            )
+            if action_id:
+                print_event(ActionStateAfter(ActionStateAfter.Data(action_id, results_to_json(res))))
             handle_action()
 
         return res

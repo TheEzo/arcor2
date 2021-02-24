@@ -9,7 +9,7 @@ jobs:
   build:
     env:
       PANTS_CONFIG_FILES: pants.ci.toml
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-18.04  # because libk4a is not supported on 20.04
     strategy:
       matrix:
         python-version: [3.8]
@@ -17,6 +17,9 @@ jobs:
     - uses: actions/checkout@v2
       with:
         fetch-depth: 0
+        lfs: true
+    - name: Checkout LFS objects
+      run: git lfs checkout
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v1
       with:

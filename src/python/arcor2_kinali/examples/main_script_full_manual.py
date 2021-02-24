@@ -4,6 +4,7 @@
 
 # within an execution package, imports of ObjectTypes should be relative, e.g.:
 # from object_types.aubo import Aubo
+from arcor2 import rest
 from arcor2.action import patch_object_actions
 from arcor2.clients import scene_service
 from arcor2.data.common import Joint, Pose, ProjectRobotJoints, uid
@@ -13,6 +14,7 @@ from arcor2_kinali.object_types.abstract_simple import Settings as SimpleSetting
 from arcor2_kinali.object_types.abstract_with_pose import Settings
 from arcor2_kinali.object_types.aubo import Aubo, MoveTypeEnum
 from arcor2_kinali.object_types.barcode import Barcode
+from arcor2_kinali.object_types.ict import Ict
 from arcor2_kinali.object_types.interaction import Interaction, NotificationLevelEnum
 from arcor2_kinali.object_types.search import LogLevel, Search, SearchEngineParameters, SearchLogLevel
 from arcor2_kinali.object_types.statistic import Statistic
@@ -27,6 +29,7 @@ def main() -> None:
     # objects with pose, with 'System' and 'Configurations' controllers
     barcode = Barcode(uid(), "Whatever", Pose(), settings=Settings("http://127.0.0.1:14000", "simulator"))
     search = Search(uid(), "Whatever", Pose(), settings=Settings("http://127.0.0.1:12000", "simulator"))
+    ict = Ict(uid(), "Whatever", Pose(), settings=Settings("http://127.0.0.1:19000", "simulator"))
 
     # objects without pose, without 'System' and 'Configurations' controllers
     interaction = Interaction(uid(), "Whatever", SimpleSettings("http://127.0.0.1:17000"))
@@ -40,6 +43,7 @@ def main() -> None:
     patch_object_actions(Aubo)
     patch_object_actions(Barcode)
     patch_object_actions(Search)
+    patch_object_actions(Ict)
     patch_object_actions(Interaction)
     patch_object_actions(Statistic)
 
@@ -53,7 +57,19 @@ def main() -> None:
     search.set_search_parameters(SearchEngineParameters(search_log_level=SearchLogLevel(LogLevel.DEBUG)))
     search.grab_image()
     interaction.add_notification("Test", NotificationLevelEnum.INFO)
-    statistic.get_groups()
+
+    try:
+        statistic.get_groups()
+    except rest.RestHttpException as e:
+        # service returned error code
+        print(f"The error code is {e.error_code}.")
+    except rest.RestException as e:
+        # request totally failed (timeout, connection error, etc)
+        print(str(e))
+
+    if ict.ready():
+        test = ict.test("OK")
+        print(test)
 
     scene_service.stop()  # this is normally done by auto-generated Resources class
 

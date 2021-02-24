@@ -1,9 +1,7 @@
 import asyncio
-import collections.abc as collections_abc
 import copy
-import inspect
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, Optional, Set
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 
 from websockets.server import WebSocketServerProtocol as WsClient
 
@@ -89,6 +87,8 @@ async def cancel_action_cb(req: srpc.p.CancelAction.Request, ui: WsClient) -> No
 
     cancel_params: Dict[str, Any] = {}
 
+    # TODO fix or remove this?
+    """
     cancel_sig = inspect.signature(cancel_method)
 
     assert glob.RUNNING_ACTION_PARAMS is not None
@@ -98,6 +98,7 @@ async def cancel_action_cb(req: srpc.p.CancelAction.Request, ui: WsClient) -> No
             cancel_params[param_name] = glob.RUNNING_ACTION_PARAMS[param_name]
         except KeyError as e:
             raise Arcor2Exception("Cancel method parameters should be subset of action parameters.") from e
+    """
 
     await hlp.run_in_executor(cancel_method, *cancel_params.values())
 
@@ -124,7 +125,7 @@ async def execute_action_cb(req: srpc.p.ExecuteAction.Request, ui: WsClient) -> 
 
     obj_id, action_name = action.parse_type()
 
-    params: Dict[str, Any] = {}
+    params: List[Any] = []
 
     for param in action.parameters:
 
@@ -137,23 +138,26 @@ async def execute_action_cb(req: srpc.p.ExecuteAction.Request, ui: WsClient) -> 
                 prev_action = glob.PROJECT.action(parsed_link.action_id)
                 raise Arcor2Exception(f"Action '{prev_action.name}' has to be executed first.")
 
-            if isinstance(results, collections_abc.Iterable) and not isinstance(results, str):
-                params[param.name] = results[parsed_link.output_index]
+            # an action result could be a tuple or a single value
+            if isinstance(results, tuple):
+                params.append(results[parsed_link.output_index])
             else:
                 assert parsed_link.output_index == 0
-                params[param.name] = results
+                params.append(results)
 
         elif param.type == common.ActionParameter.TypeEnum.CONSTANT:
             const = glob.PROJECT.constant(param.value)
             # TODO use plugin to get the value
             import json
 
-            params[param.name] = json.loads(const.value)
+            params.append(json.loads(const.value))
         else:
 
             try:
-                params[param.name] = plugin_from_type_name(param.type).parameter_execution_value(
-                    get_types_dict(), glob.SCENE, glob.PROJECT, action.id, param.name
+                params.append(
+                    plugin_from_type_name(param.type).parameter_execution_value(
+                        get_types_dict(), glob.SCENE, glob.PROJECT, action.id, param.name
+                    )
                 )
             except ParameterPluginException as e:
                 glob.logger.error(e)
@@ -352,9 +356,7 @@ async def rename_action_point_cb(req: srpc.p.RenameActionPoint.Request, ui: WsCl
     if req.args.new_name == ap.name:
         return None
 
-    if not hlp.is_valid_identifier(req.args.new_name):
-        raise Arcor2Exception("Name has to be valid Python identifier.")
-
+    hlp.is_valid_identifier(req.args.new_name)
     unique_name(req.args.new_name, glob.PROJECT.action_points_names)
 
     if req.dry_run:
@@ -385,7 +387,7 @@ def detect_ap_loop(ap: common.BareActionPoint, new_parent_id: str) -> None:
         visited_ids.add(ap.id)
 
         if ap.parent is None:
-            break
+            break  # type: ignore  # this is certainly reachable
 
         try:
             ap = glob.PROJECT.bare_action_point(ap.parent)
@@ -433,7 +435,8 @@ async def update_action_point_parent_cb(req: srpc.p.UpdateActionPointParent.Requ
     Can't send orientation changes and then ActionPointChanged/UPDATE_BASE (or vice versa)
     because UI would display orientations wrongly (for a short moment).
     """
-    evt = sevts.p.ActionPointChanged(ap)
+    # 'ap' is BareActionPoint, that does not contain orientations
+    evt = sevts.p.ActionPointChanged(glob.PROJECT.action_point(req.args.action_point_id))
     evt.change_type = Event.Type.UPDATE
     asyncio.ensure_future(notif.broadcast_event(evt))
     return None
@@ -763,8 +766,7 @@ async def add_action_point_cb(req: srpc.p.AddActionPoint.Request, ui: WsClient) 
     unique_name(req.args.name, glob.PROJECT.action_points_names)
     check_ap_parent(req.args.parent)
 
-    if not hlp.is_valid_identifier(req.args.name):
-        raise Arcor2Exception("Name has to be valid Python identifier.")
+    hlp.is_valid_identifier(req.args.name)
 
     if req.dry_run:
         return None
@@ -839,6 +841,86 @@ async def remove_action_point_cb(req: srpc.p.RemoveActionPoint.Request, ui: WsCl
 
 @scene_needed
 @project_needed
+async def copy_action_point_cb(req: srpc.p.CopyActionPoint.Request, ui: WsClient) -> None:
+
+    assert glob.PROJECT
+
+    def make_name_unique(orig_name: str, names: Set[str]) -> str:
+
+        cnt = 1
+        name = orig_name
+
+        while name in names:
+            name = f"{orig_name}_{cnt}"
+            cnt += 1
+
+        return name
+
+    async def copy_action_point(
+        orig_ap: common.BareActionPoint,
+        new_parent_id: Optional[str] = None,
+        position: Optional[common.Position] = None,
+    ) -> None:
+
+        assert glob.PROJECT
+
+        ap = glob.PROJECT.upsert_action_point(
+            common.uid(),
+            make_name_unique(f"copy_of_{orig_ap.name}", glob.PROJECT.action_points_names),
+            orig_ap.position if position is None else position,
+            orig_ap.parent if new_parent_id is None else new_parent_id,
+        )
+
+        ap_added_evt = sevts.p.ActionPointChanged(ap)
+        ap_added_evt.change_type = Event.Type.ADD
+        await notif.broadcast_event(ap_added_evt)
+
+        for ori in glob.PROJECT.ap_orientations(orig_ap.id):
+            new_ori = copy.deepcopy(ori)
+            new_ori.id = common.uid()
+            glob.PROJECT.upsert_orientation(ap.id, new_ori)
+
+            ori_added_evt = sevts.p.OrientationChanged(new_ori)
+            ori_added_evt.change_type = Event.Type.ADD
+            ori_added_evt.parent_id = ap.id
+            await notif.broadcast_event(ori_added_evt)
+
+        for joints in glob.PROJECT.ap_joints(orig_ap.id):
+            new_joints = copy.deepcopy(joints)
+            new_joints.id = common.uid()
+            glob.PROJECT.upsert_joints(ap.id, new_joints)
+
+            joints_added_evt = sevts.p.JointsChanged(new_joints)
+            joints_added_evt.change_type = Event.Type.ADD
+            joints_added_evt.parent_id = ap.id
+            await notif.broadcast_event(joints_added_evt)
+
+        action_names = glob.PROJECT.action_names  # action name has to be globally unique
+        for act in glob.PROJECT.ap_actions(orig_ap.id):
+            new_act = copy.deepcopy(act)
+            new_act.id = common.uid()
+            new_act.name = make_name_unique(f"copy_of_{act.name}", action_names)
+            glob.PROJECT.upsert_action(ap.id, new_act)
+
+            action_added_evt = sevts.p.ActionChanged(new_act)
+            action_added_evt.change_type = Event.Type.ADD
+            action_added_evt.parent_id = ap.id
+            await notif.broadcast_event(action_added_evt)
+
+        for child_ap in glob.PROJECT.action_points_with_parent:
+            if child_ap.parent == orig_ap.id:
+                await copy_action_point(child_ap, ap.id)
+
+    original_ap = glob.PROJECT.bare_action_point(req.args.id)
+
+    if req.dry_run:
+        return
+
+    asyncio.ensure_future(copy_action_point(original_ap, position=req.args.position))
+
+
+@scene_needed
+@project_needed
 async def add_action_cb(req: srpc.p.AddAction.Request, ui: WsClient) -> None:
 
     assert glob.PROJECT
@@ -846,10 +928,8 @@ async def add_action_cb(req: srpc.p.AddAction.Request, ui: WsClient) -> None:
 
     ap = glob.PROJECT.bare_action_point(req.args.action_point_id)
 
-    unique_name(req.args.name, glob.PROJECT.action_user_names())
-
-    if not hlp.is_valid_identifier(req.args.name):
-        raise Arcor2Exception("Action name has to be valid Python identifier.")
+    unique_name(req.args.name, glob.PROJECT.action_names)
+    hlp.is_valid_identifier(req.args.name)
 
     new_action = common.Action(common.uid(), req.args.name, req.args.type, req.args.parameters, req.args.flows)
 
@@ -1120,8 +1200,7 @@ def check_constant(constant: common.ProjectConstant) -> None:
 
     assert glob.PROJECT
 
-    if not hlp.is_valid_identifier(constant.name):
-        raise Arcor2Exception("Name has to be valid Python identifier.")
+    hlp.is_valid_identifier(constant.name)
 
     for const in glob.PROJECT.constants:
 
@@ -1132,6 +1211,12 @@ def check_constant(constant: common.ProjectConstant) -> None:
             raise Arcor2Exception("Name has to be unique.")
 
     # TODO check using (constant?) plugin
+    import json
+
+    val = json.loads(constant.value)
+
+    if not isinstance(val, (int, float, str, bool)):
+        raise Arcor2Exception("Only basic types are supported so far.")
 
 
 @scene_needed
@@ -1340,7 +1425,7 @@ async def rename_action_cb(req: srpc.p.RenameAction.Request, ui: WsClient) -> No
 
     assert glob.PROJECT
 
-    unique_name(req.args.new_name, glob.PROJECT.action_user_names())
+    unique_name(req.args.new_name, glob.PROJECT.action_names)
 
     if req.dry_run:
         return None

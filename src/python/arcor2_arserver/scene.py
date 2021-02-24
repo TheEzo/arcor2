@@ -5,6 +5,7 @@ from arcor2 import helpers as hlp
 from arcor2.cached import CachedScene, UpdateableCachedScene
 from arcor2.clients import aio_scene_service as scene_srv
 from arcor2.data.common import Parameter, Pose, SceneObject
+from arcor2.data.events import Event
 from arcor2.data.object_type import Models
 from arcor2.exceptions import Arcor2Exception
 from arcor2.object_types.abstract import Generic, GenericWithPose, Robot
@@ -15,21 +16,51 @@ from arcor2_arserver.clients import persistent_storage as storage
 from arcor2_arserver.object_types.data import ObjectTypeData
 from arcor2_arserver.objects_actions import get_object_types
 from arcor2_arserver_data.events.common import ShowMainScreen
-from arcor2_arserver_data.events.scene import SceneClosed, SceneState
+from arcor2_arserver_data.events.scene import SceneClosed, SceneObjectChanged, SceneState
 
 # TODO maybe this could be property of ARServerScene(CachedScene)?
 _scene_state: SceneState.Data.StateEnum = SceneState.Data.StateEnum.Stopped
 
 
-async def set_object_pose(obj: GenericWithPose, pose: Pose) -> None:
-    """
-    Object pose is property that might call scene service - that's why it should be called using executor.
+async def update_scene_object_pose(
+    obj: SceneObject, pose: Optional[Pose] = None, obj_inst: Optional[GenericWithPose] = None
+) -> None:
+    """Performs all necessary actions when pose of an object is updated.
+
     :param obj:
     :param pose:
+    :param obj_inst:
     :return:
     """
 
-    await hlp.run_in_executor(setattr, obj, "pose", pose)
+    assert glob.SCENE
+
+    if pose:
+        # SceneObject pose was not updated before
+        obj.pose = pose
+    else:
+        # SceneObject pose was already updated
+        pose = obj.pose
+
+    glob.SCENE.update_modified()
+
+    evt = SceneObjectChanged(obj)
+    evt.change_type = Event.Type.UPDATE
+    await notif.broadcast_event(evt)
+
+    glob.OBJECTS_WITH_UPDATED_POSE.add(obj.id)
+
+    if scene_started():
+
+        if obj_inst is None:
+            inst = get_instance(obj.id)
+            assert isinstance(inst, GenericWithPose)
+            obj_inst = inst
+
+        assert pose is not None
+
+        # Object pose is property that might call scene service - that's why it has to be called using executor.
+        await hlp.run_in_executor(setattr, obj_inst, "pose", pose)
 
 
 async def set_scene_state(state: SceneState.Data.StateEnum, message: Optional[str] = None) -> None:
@@ -125,8 +156,7 @@ def check_object(obj: SceneObject, new_one: bool = False) -> None:
         if obj.name in glob.SCENE.object_names():
             raise Arcor2Exception("Name is already used.")
 
-    if not hlp.is_valid_identifier(obj.name):
-        raise Arcor2Exception("Object name invalid (should be snake_case).")
+    hlp.is_valid_identifier(obj.name)
 
 
 async def add_object_to_scene(obj: SceneObject, dry_run: bool = False) -> None:
@@ -164,32 +194,38 @@ async def create_object_instance(obj: SceneObject, overrides: Optional[List[Para
 
     try:
 
-        if issubclass(obj_type.type_def, Robot):
-            assert obj.pose is not None
-            glob.SCENE_OBJECT_INSTANCES[obj.id] = await hlp.run_in_executor(
-                obj_type.type_def, obj.id, obj.name, obj.pose, settings
-            )
-        elif issubclass(obj_type.type_def, GenericWithPose):
-            assert obj.pose is not None
-            coll_model: Optional[Models] = None
-            if obj_type.meta.object_model:
-                coll_model = obj_type.meta.object_model.model()
+        try:
 
-            glob.SCENE_OBJECT_INSTANCES[obj.id] = await hlp.run_in_executor(
-                obj_type.type_def, obj.id, obj.name, obj.pose, coll_model, settings
-            )
+            if issubclass(obj_type.type_def, Robot):
+                assert obj.pose is not None
+                glob.SCENE_OBJECT_INSTANCES[obj.id] = await hlp.run_in_executor(
+                    obj_type.type_def, obj.id, obj.name, obj.pose, settings
+                )
+            elif issubclass(obj_type.type_def, GenericWithPose):
+                assert obj.pose is not None
+                coll_model: Optional[Models] = None
+                if obj_type.meta.object_model:
+                    coll_model = obj_type.meta.object_model.model()
 
-        elif issubclass(obj_type.type_def, Generic):
-            assert obj.pose is None
-            glob.SCENE_OBJECT_INSTANCES[obj.id] = await hlp.run_in_executor(
-                obj_type.type_def, obj.id, obj.name, settings
-            )
+                glob.SCENE_OBJECT_INSTANCES[obj.id] = await hlp.run_in_executor(
+                    obj_type.type_def, obj.id, obj.name, obj.pose, coll_model, settings
+                )
 
-        else:
-            raise Arcor2Exception("Object type with unknown base.")
+            elif issubclass(obj_type.type_def, Generic):
+                assert obj.pose is None
+                glob.SCENE_OBJECT_INSTANCES[obj.id] = await hlp.run_in_executor(
+                    obj_type.type_def, obj.id, obj.name, settings
+                )
 
-    except (TypeError, ValueError) as e:  # catch some most often exceptions
-        raise Arcor2Exception("Failed to create object instance.") from e
+            else:
+                raise Arcor2Exception("Object type with unknown base.")
+
+        except (TypeError, ValueError) as e:  # catch some most often exceptions
+            raise Arcor2Exception("Unhandled error.") from e
+
+    except Arcor2Exception as e:
+        # make the exception a bit more user-friendly by including the object's name
+        raise Arcor2Exception(f"Failed to initialize {obj.name}. {str(e)}") from e
 
     return None
 
@@ -209,12 +245,22 @@ async def open_scene(scene_id: str) -> None:
         raise Arcor2Exception(f"Failed to open scene. {str(e)}") from e
 
 
+# TODO optional parameter for expected return type
 def get_instance(obj_id: str) -> Generic:
 
     if obj_id not in glob.SCENE_OBJECT_INSTANCES:
         raise Arcor2Exception("Unknown object/service ID.")
 
     return glob.SCENE_OBJECT_INSTANCES[obj_id]
+
+
+async def cleanup_object(obj: Generic) -> None:
+
+    try:
+        await hlp.run_in_executor(obj.cleanup)
+    except Arcor2Exception as e:
+        # make the exception a bit more user-friendly by including the object's name
+        raise Arcor2Exception(f"Failed to cleanup {obj.name}. {str(e)}") from e
 
 
 async def stop_scene(message: Optional[str] = None) -> None:
@@ -233,7 +279,7 @@ async def stop_scene(message: Optional[str] = None) -> None:
             return
 
     try:
-        await asyncio.gather(*[hlp.run_in_executor(obj.cleanup) for obj in glob.SCENE_OBJECT_INSTANCES.values()])
+        await asyncio.gather(*[cleanup_object(obj) for obj in glob.SCENE_OBJECT_INSTANCES.values()])
     except Arcor2Exception as e:
         glob.logger.exception("Exception occurred while cleaning up objects.")
         await set_scene_state(SceneState.Data.StateEnum.Stopped, str(e))

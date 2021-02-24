@@ -2,7 +2,7 @@ import asyncio
 import copy
 import functools
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional, Set
+from typing import AsyncGenerator, Optional
 
 import quaternion
 from websockets.server import WebSocketServerProtocol as WsClient
@@ -13,6 +13,7 @@ from arcor2.clients import aio_scene_service as scene_srv
 from arcor2.data import common, object_type
 from arcor2.data.events import Event, PackageState
 from arcor2.exceptions import Arcor2Exception
+from arcor2.image import image_from_str
 from arcor2_arserver import globals as glob
 from arcor2_arserver import notifications as notif
 from arcor2_arserver.clients import persistent_storage as storage
@@ -21,9 +22,9 @@ from arcor2_arserver.helpers import unique_name, ctx_read_lock, ctx_write_lock
 from arcor2_arserver.objects_actions import get_object_types
 from arcor2_arserver.project import (
     associated_projects,
+    invalidate_joints_using_object_as_parent,
     projects_using_object,
     remove_object_references_from_projects,
-    scene_object_pose_updated,
 )
 from arcor2_arserver.robot import get_end_effector_pose
 from arcor2_arserver.scene import (
@@ -39,12 +40,11 @@ from arcor2_arserver.scene import (
     scenes,
     start_scene,
     stop_scene,
+    update_scene_object_pose,
 )
 from arcor2_arserver_data import events as sevts
 from arcor2_arserver_data import rpc as srpc
 from arcor2_calibration_data import client as calibration
-
-OBJECTS_WITH_UPDATED_POSE: Set[str] = set()
 
 
 @asynccontextmanager
@@ -125,15 +125,10 @@ async def close_scene_cb(req: srpc.s.CloseScene.Request, ui: WsClient) -> None:
     if req.dry_run:
         return None
 
-    async with glob.LOCK.get_lock() as lock:  # todo test it!
-        # todo check if anything locked
-        assert glob.SCENE
-
-        scene_id = glob.SCENE.id
-        glob.SCENE = None
-        glob.LOCK = None
-        OBJECTS_WITH_UPDATED_POSE.clear()
-        asyncio.ensure_future(notify_scene_closed(scene_id))
+    scene_id = glob.SCENE.id
+    glob.SCENE = None
+    glob.OBJECTS_WITH_UPDATED_POSE.clear()
+    asyncio.ensure_future(notify_scene_closed(scene_id))
 
 
 @scene_needed
@@ -143,11 +138,9 @@ async def save_scene_cb(req: srpc.s.SaveScene.Request, ui: WsClient) -> None:
     assert glob.SCENE
     glob.SCENE.modified = await storage.update_scene(glob.SCENE.scene)
     asyncio.ensure_future(notif.broadcast_event(sevts.s.SceneSaved()))
-    async with glob.LOCK.get_lock():
-        # todo check if anything locked
-        for obj_id in OBJECTS_WITH_UPDATED_POSE:
-            asyncio.ensure_future(scene_object_pose_updated(glob.SCENE.id, obj_id))
-        OBJECTS_WITH_UPDATED_POSE.clear()
+    for obj_id in glob.OBJECTS_WITH_UPDATED_POSE:
+        asyncio.ensure_future(invalidate_joints_using_object_as_parent(glob.SCENE.object(obj_id)))
+    glob.OBJECTS_WITH_UPDATED_POSE.clear()
     return None
 
 
@@ -321,15 +314,16 @@ async def remove_from_scene_cb(req: srpc.s.RemoveFromScene.Request, ui: WsClient
         obj = glob.SCENE.object(req.args.id)
         glob.SCENE.delete_object(req.args.id)
 
-        if req.args.id in OBJECTS_WITH_UPDATED_POSE:
-            OBJECTS_WITH_UPDATED_POSE.remove(req.args.id)
+        if req.args.id in glob.OBJECTS_WITH_UPDATED_POSE:
+            glob.OBJECTS_WITH_UPDATED_POSE.remove(req.args.id)
 
         evt = sevts.s.SceneObjectChanged(obj)
         evt.change_type = Event.Type.REMOVE
         asyncio.ensure_future(notif.broadcast_event(evt))
 
+        # TODO this should be done after scene is saved
         asyncio.ensure_future(remove_object_references_from_projects(req.args.id))
-    return None
+        return None
 
 
 @scene_needed
@@ -398,14 +392,7 @@ async def update_object_pose_using_robot_cb(req: srpc.o.UpdateObjectPoseUsingRob
         new_pose.orientation.as_quaternion() * quaternion.quaternion(0, 1, 0, 0)
     )
 
-    glob.SCENE.update_modified()
-
-    evt = sevts.s.SceneObjectChanged(scene_object)
-    evt.change_type = Event.Type.UPDATE
-    asyncio.ensure_future(notif.broadcast_event(evt))
-
-    OBJECTS_WITH_UPDATED_POSE.add(scene_object.id)
-
+    asyncio.ensure_future(update_scene_object_pose(scene_object))
     return None
 
 
@@ -430,16 +417,7 @@ async def update_object_pose_cb(req: srpc.s.UpdateObjectPose.Request, ui: WsClie
     if req.dry_run:
         return
 
-    obj.pose = req.args.pose
-
-    glob.SCENE.update_modified()
-
-    evt = sevts.s.SceneObjectChanged(obj)
-    evt.change_type = Event.Type.UPDATE
-    asyncio.ensure_future(notif.broadcast_event(evt))
-
-    OBJECTS_WITH_UPDATED_POSE.add(obj.id)
-
+    asyncio.ensure_future(update_scene_object_pose(obj, req.args.pose))
     return None
 
 
@@ -460,8 +438,7 @@ async def rename_object_cb(req: srpc.s.RenameObject.Request, ui: WsClient) -> No
         if obj_name == req.args.new_name:
             raise Arcor2Exception("Object name already exists.")
 
-    if not hlp.is_valid_identifier(req.args.new_name):
-        raise Arcor2Exception("Object name invalid (should be snake_case).")
+    hlp.is_valid_identifier(req.args.new_name)
 
     if req.dry_run:
         return None
@@ -554,10 +531,24 @@ async def copy_scene_cb(req: srpc.s.CopyScene.Request, ui: WsClient) -> None:
 
 
 # TODO maybe this would better fit into another category of RPCs? Like common/misc?
-async def calibration_cb(req: srpc.c.Calibration.Request, ui: WsClient) -> srpc.c.Calibration.Response:
+async def calibration_cb(req: srpc.c.GetCameraPose.Request, ui: WsClient) -> srpc.c.GetCameraPose.Response:
 
-    return srpc.c.Calibration.Response(
-        data=await hlp.run_in_executor(calibration.estimate_camera_pose, req.args.camera_parameters, req.args.image)
+    # TODO estimated pose should be rather returned in an event (it is possibly a long-running process)
+    return srpc.c.GetCameraPose.Response(
+        data=await hlp.run_in_executor(
+            calibration.estimate_camera_pose, req.args.camera_parameters, image_from_str(req.args.image)
+        )
+    )
+
+
+# TODO maybe this would better fit into another category of RPCs? Like common/misc?
+async def marker_corners_cb(req: srpc.c.MarkersCorners.Request, ui: WsClient) -> srpc.c.MarkersCorners.Response:
+
+    # TODO should be rather returned in an event (it is possibly a long-running process)
+    return srpc.c.MarkersCorners.Response(
+        data=await hlp.run_in_executor(
+            calibration.markers_corners, req.args.camera_parameters, image_from_str(req.args.image)
+        )
     )
 
 

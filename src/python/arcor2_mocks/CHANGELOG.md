@@ -2,6 +2,17 @@
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
+## [0.11.0] - 2021-02-08
+
+### Changed
+- Part of the code refactored into `arcor2/flask.py`.
+- Update of 3rd party dependencies.
+
+## [0.10.0] - 2020-12-14
+
+### Changed
+- Scene service mock updated to match Scene 0.4.0.
+
 ## [0.9.1] - 2020-10-19
 
 ### Changed

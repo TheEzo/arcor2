@@ -2,20 +2,30 @@ import asyncio
 import time
 from typing import Awaitable, Callable, Dict
 
+from arcor2_calibration_data import client as calib_client
+from arcor2_calibration_data.client import CalibrateRobotArgs
 from websockets.server import WebSocketServerProtocol as WsClient
 
 from arcor2 import transformations as tr
 from arcor2 import ws_server
+from arcor2.clients.persistent_storage import URL as ps_url
 from arcor2.data import common
 from arcor2.exceptions import Arcor2Exception
-from arcor2.object_types.abstract import Robot
+from arcor2.helpers import run_in_executor
+from arcor2.object_types.abstract import Camera, Robot
+from arcor2_arserver import camera
 from arcor2_arserver import globals as glob
+from arcor2_arserver import notifications as notif
 from arcor2_arserver import objects_actions as osa
 from arcor2_arserver import robot
 from arcor2_arserver.decorators import project_needed, scene_needed
-from arcor2_arserver.scene import ensure_scene_started, scene_started
+from arcor2_arserver.scene import ensure_scene_started, scene_started, update_scene_object_pose
 from arcor2_arserver_data import events as sevts
 from arcor2_arserver_data import rpc as srpc
+from arcor2_arserver_data.events.common import ProcessState
+from arcor2_arserver_data.events.robot import HandTeachingMode
+
+RBT_CALIB = "RobotCalibration"
 
 TaskDict = Dict[str, asyncio.Task]
 
@@ -230,7 +240,9 @@ async def move_to_pose_cb(req: srpc.r.MoveToPose.Request, ui: WsClient) -> None:
         raise Arcor2Exception("Position or orientation should be given.")
 
     # TODO check if the target pose is reachable (dry_run)
-    asyncio.ensure_future(robot.move_to_pose(req.args.robot_id, req.args.end_effector_id, target_pose, req.args.speed))
+    asyncio.ensure_future(
+        robot.move_to_pose(req.args.robot_id, req.args.end_effector_id, target_pose, req.args.speed, req.args.safe)
+    )
 
 
 @scene_needed
@@ -239,7 +251,7 @@ async def move_to_joints_cb(req: srpc.r.MoveToJoints.Request, ui: WsClient) -> N
     ensure_scene_started()
     await check_feature(req.args.robot_id, Robot.move_to_joints.__name__)
     await robot.check_robot_before_move(req.args.robot_id)
-    asyncio.ensure_future(robot.move_to_joints(req.args.robot_id, req.args.joints, req.args.speed))
+    asyncio.ensure_future(robot.move_to_joints(req.args.robot_id, req.args.joints, req.args.speed, req.args.safe))
 
 
 @scene_needed
@@ -275,7 +287,12 @@ async def move_to_action_point_cb(req: srpc.r.MoveToActionPoint.Request, ui: WsC
         # TODO check if the target pose is reachable (dry_run)
         asyncio.ensure_future(
             robot.move_to_ap_orientation(
-                req.args.robot_id, req.args.end_effector_id, pose, req.args.speed, req.args.orientation_id
+                req.args.robot_id,
+                req.args.end_effector_id,
+                pose,
+                req.args.speed,
+                req.args.orientation_id,
+                req.args.safe,
             )
         )
 
@@ -287,7 +304,7 @@ async def move_to_action_point_cb(req: srpc.r.MoveToActionPoint.Request, ui: WsC
 
         # TODO check if the joints are within limits and reachable (dry_run)
         asyncio.ensure_future(
-            robot.move_to_ap_joints(req.args.robot_id, joints.joints, req.args.speed, req.args.joints_id)
+            robot.move_to_ap_joints(req.args.robot_id, joints.joints, req.args.speed, req.args.joints_id, req.args.safe)
         )
 
 
@@ -315,3 +332,90 @@ async def fk_cb(req: srpc.r.ForwardKinematics.Request, ui: WsClient) -> srpc.r.F
     resp = srpc.r.ForwardKinematics.Response()
     resp.data = pose
     return resp
+
+
+async def calibrate_robot(robot_inst: Robot, camera_inst: Camera, move_to_calibration_pose: bool) -> None:
+
+    assert glob.SCENE
+    assert camera_inst.color_camera_params
+
+    # TODO it should not be possible to close the scene during this process
+
+    await notif.broadcast_event(ProcessState(ProcessState.Data(RBT_CALIB, ProcessState.Data.StateEnum.Started)))
+
+    try:
+
+        if move_to_calibration_pose:
+            await run_in_executor(robot_inst.move_to_calibration_pose)
+        robot_joints = await run_in_executor(robot_inst.robot_joints)
+        depth_image = await run_in_executor(camera_inst.depth_image, 128)
+
+        args = CalibrateRobotArgs(
+            robot_joints,
+            robot_inst.pose,
+            camera_inst.pose,
+            camera_inst.color_camera_params,
+            f"{ps_url}/models/{robot_inst.urdf_package_name}/mesh/file",
+        )
+
+        new_pose = await run_in_executor(calib_client.calibrate_robot, args, depth_image)
+
+    except Arcor2Exception as e:
+        await notif.broadcast_event(
+            ProcessState(ProcessState.Data(RBT_CALIB, ProcessState.Data.StateEnum.Failed, str(e)))
+        )
+        glob.logger.exception("Failed to calibrate the robot.")
+        return
+
+    await update_scene_object_pose(glob.SCENE.object(robot_inst.id), new_pose, robot_inst)
+    await notif.broadcast_event(ProcessState(ProcessState.Data(RBT_CALIB, ProcessState.Data.StateEnum.Finished)))
+
+
+@scene_needed
+async def calibrate_robot_cb(req: srpc.r.CalibrateRobot.Request, ui: WsClient) -> None:
+
+    ensure_scene_started()
+    robot_inst = await osa.get_robot_instance(req.args.robot_id)
+
+    if not robot_inst.urdf_package_name:
+        raise Arcor2Exception("Robot with model required!")
+
+    if req.args.camera_id:
+        camera_inst = camera.get_camera_instance(req.args.camera_id)
+    else:
+        for obj in glob.SCENE_OBJECT_INSTANCES.values():
+            if isinstance(obj, Camera):
+                camera_inst = obj
+                break
+        else:
+            raise Arcor2Exception("No camera found.")
+
+    if camera_inst.color_camera_params is None:
+        raise Arcor2Exception("Calibrated camera required!")
+
+    # TODO check camera features / check that it supports depth
+    asyncio.ensure_future(calibrate_robot(robot_inst, camera_inst, req.args.move_to_calibration_pose))
+
+    return None
+
+
+@scene_needed
+async def hand_teaching_mode_cb(req: srpc.r.HandTeachingMode.Request, ui: WsClient) -> None:
+
+    ensure_scene_started()
+    robot_inst = await osa.get_robot_instance(req.args.robot_id)
+
+    otd = osa.get_obj_type_data(req.args.robot_id)
+    assert otd.robot_meta is not None
+    if not otd.robot_meta.features.hand_teaching:
+        raise Arcor2Exception("Robot does not support hand teaching.")
+
+    if req.args.enable == robot_inst.hand_teaching_mode:
+        raise Arcor2Exception("That's the current state.")
+
+    if req.dry_run:
+        return
+
+    robot_inst.set_hand_teaching_mode(req.args.enable)
+    evt = HandTeachingMode(HandTeachingMode.Data(req.args.robot_id, req.args.enable))
+    asyncio.ensure_future(notif.broadcast_event(evt))
