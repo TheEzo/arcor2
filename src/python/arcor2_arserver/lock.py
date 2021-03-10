@@ -12,21 +12,24 @@ class Lock:
     SCENE_NAME = "SCENE"
     PROJECT_NAME = "PROJECT"
 
+    CLEAN_DELAY = 10
+    LOCK_TIMEOUT = 300  # 5 minutes
+
     class Data:
         __slots__ = "owners", "timestamp", "count"
 
         def __init__(self, owner):
             self.owners = [owner]
-            self.timestamp = datetime.now()
+            self.timestamp = datetime.utcnow()
             self.count = 1
 
         def inc_count(self):
             self.count += 1
-            self.timestamp = datetime.now()
+            self.timestamp = datetime.utcnow()
 
         def dec_count(self):
             self.count -= 1
-            self.timestamp = datetime.now()
+            self.timestamp = datetime.utcnow()
 
     class LockedObject:
         __slots__ = "read", "write", "tree"
@@ -107,6 +110,8 @@ class Lock:
 
         self._lock = asyncio.Lock()
         self._locked_objects: Dict[str, "Lock.LockedObject"] = {}
+
+        asyncio.create_task(self.clean_locks())
 
     @property
     def scene(self):
@@ -242,3 +247,13 @@ class Lock:
         Method should be used for operation with whole scene/project, no others
         """
         yield self._lock
+
+    async def clean_locks(self):
+
+        # TODO choose solution
+        #  1: looping function checking all locks
+        #  2: plan coroutine to release lock after time, cancel when released
+        #
+        # TODO maybe would be good to set time to None for tasks planned from BE and don't release them automatically
+
+        asyncio.create_task(self.clean_locks())
