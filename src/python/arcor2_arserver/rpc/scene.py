@@ -81,19 +81,19 @@ async def new_scene_cb(req: srpc.s.NewScene.Request, ui: WsClient) -> None:
     :return:
     """
 
-    if glob.PACKAGE_STATE.state in PackageState.RUN_STATES:
-        raise Arcor2Exception("Can't create scene while package runs.")
-
-    assert glob.SCENE is None
-
-    for scene_id in (await storage.get_scenes()).items:
-        if req.args.name == scene_id.name:
-            raise Arcor2Exception("Name already used.")
-
-    if req.dry_run:
-        return None
-
     async with ctx_write_lock(glob.LOCK.SCENE_NAME, glob.LOCK.SERVER_NAME):
+        if glob.PACKAGE_STATE.state in PackageState.RUN_STATES:
+            raise Arcor2Exception("Can't create scene while package runs.")
+
+        assert glob.SCENE is None
+
+        for scene_id in (await storage.get_scenes()).items:
+            if req.args.name == scene_id.name:
+                raise Arcor2Exception("Name already used.")
+
+        if req.dry_run:
+            return None
+
         assert glob.SCENE is None
 
         await get_object_types()  # TODO not ideal, may take quite long time
@@ -122,6 +122,9 @@ async def close_scene_cb(req: srpc.s.CloseScene.Request, ui: WsClient) -> None:
 
     can_modify_scene()  # can't close scene while started
 
+    if glob.LOCK.get_locked_roots_count():
+        raise Arcor2Exception("Scene has locked objects")
+
     if req.dry_run:
         return None
 
@@ -135,31 +138,32 @@ async def close_scene_cb(req: srpc.s.CloseScene.Request, ui: WsClient) -> None:
 @no_project
 async def save_scene_cb(req: srpc.s.SaveScene.Request, ui: WsClient) -> None:
 
-    assert glob.SCENE
-    glob.SCENE.modified = await storage.update_scene(glob.SCENE.scene)
-    asyncio.ensure_future(notif.broadcast_event(sevts.s.SceneSaved()))
-    for obj_id in glob.OBJECTS_WITH_UPDATED_POSE:
-        asyncio.ensure_future(invalidate_joints_using_object_as_parent(glob.SCENE.object(obj_id)))
-    glob.OBJECTS_WITH_UPDATED_POSE.clear()
-    return None
+    async with glob.LOCK.get_lock():
+        assert glob.SCENE
+        glob.SCENE.modified = await storage.update_scene(glob.SCENE.scene)
+        asyncio.ensure_future(notif.broadcast_event(sevts.s.SceneSaved()))
+        for obj_id in glob.OBJECTS_WITH_UPDATED_POSE:
+            asyncio.ensure_future(invalidate_joints_using_object_as_parent(glob.SCENE.object(obj_id)))
+        glob.OBJECTS_WITH_UPDATED_POSE.clear()
+        return None
 
 
 @no_project
 async def open_scene_cb(req: srpc.s.OpenScene.Request, ui: WsClient) -> None:
 
-    if glob.PACKAGE_STATE.state in PackageState.RUN_STATES:
-        raise Arcor2Exception("Can't open scene while package runs.")
-
     async with glob.LOCK.get_lock():
+        if glob.PACKAGE_STATE.state in PackageState.RUN_STATES:
+            raise Arcor2Exception("Can't open scene while package runs.")
+
         assert not glob.SCENE
 
         await open_scene(req.args.id)
 
-    assert glob.SCENE
-    assert glob.SCENE.int_modified is None
-    assert not glob.SCENE.has_changes()
-    asyncio.ensure_future(notif.broadcast_event(sevts.s.OpenScene(data=sevts.s.OpenScene.Data(glob.SCENE.scene))))
-    return None
+        assert glob.SCENE
+        assert glob.SCENE.int_modified is None
+        assert not glob.SCENE.has_changes()
+        asyncio.ensure_future(notif.broadcast_event(sevts.s.OpenScene(data=sevts.s.OpenScene.Data(glob.SCENE.scene))))
+        return None
 
 
 async def list_scenes_cb(req: srpc.s.ListScenes.Request, ui: WsClient) -> srpc.s.ListScenes.Response:
@@ -179,9 +183,9 @@ async def add_object_to_scene_cb(req: srpc.s.AddObjectToScene.Request, ui: WsCli
 
     assert glob.SCENE
 
-    can_modify_scene()
-
     async with ctx_read_lock(glob.SCENE.id, 'ui.owner'):
+        can_modify_scene()
+
         obj = common.SceneObject(common.uid(), req.args.name, req.args.type, req.args.pose, req.args.parameters)
 
         await add_object_to_scene(obj, dry_run=req.dry_run)
@@ -189,12 +193,12 @@ async def add_object_to_scene_cb(req: srpc.s.AddObjectToScene.Request, ui: WsCli
         if req.dry_run:
             return None
 
-    glob.SCENE.update_modified()
+        glob.SCENE.update_modified()
 
-    evt = sevts.s.SceneObjectChanged(obj)
-    evt.change_type = Event.Type.ADD
-    asyncio.ensure_future(notif.broadcast_event(evt))
-    return None
+        evt = sevts.s.SceneObjectChanged(obj)
+        evt.change_type = Event.Type.ADD
+        asyncio.ensure_future(notif.broadcast_event(evt))
+        return None
 
 
 @scene_needed
@@ -205,21 +209,20 @@ async def update_object_parameters_cb(req: srpc.s.UpdateObjectParameters.Request
 
     can_modify_scene()
 
-    async with ctx_write_lock(req.args.id):
-        obj = glob.SCENE.object(req.args.id)
+    obj = glob.SCENE.object(req.args.id)
 
-        if obj.type not in glob.OBJECT_TYPES:
-            raise Arcor2Exception("Unknown object type.")
+    if obj.type not in glob.OBJECT_TYPES:
+        raise Arcor2Exception("Unknown object type.")
 
-        obj_type = glob.OBJECT_TYPES[obj.type]
+    obj_type = glob.OBJECT_TYPES[obj.type]
 
-        check_object_parameters(obj_type, req.args.parameters)
+    check_object_parameters(obj_type, req.args.parameters)
 
-        if req.dry_run:
-            return None
+    if req.dry_run:
+        return None
 
-        obj.parameters = req.args.parameters
-        glob.SCENE.update_modified()
+    obj.parameters = req.args.parameters
+    glob.SCENE.update_modified()
 
     evt = sevts.s.SceneObjectChanged(obj)
     evt.change_type = Event.Type.UPDATE
@@ -239,17 +242,17 @@ async def scene_object_usage_request_cb(
 
     assert glob.SCENE
 
-    if not (any(obj.id == req.args.id for obj in glob.SCENE.objects)):
-        raise Arcor2Exception("Unknown ID.")
-
     async with ctx_read_lock(req.args.id):
+        if not (any(obj.id == req.args.id for obj in glob.SCENE.objects)):
+            raise Arcor2Exception("Unknown ID.")
+
         resp = srpc.s.SceneObjectUsage.Response()
         resp.data = set()
 
         async for project in projects_using_object(glob.SCENE.id, req.args.id):
             resp.data.add(project.id)
 
-    return resp
+        return resp
 
 
 # TODO move to objects
@@ -299,9 +302,9 @@ async def remove_from_scene_cb(req: srpc.s.RemoveFromScene.Request, ui: WsClient
 
     assert glob.SCENE
 
-    can_modify_scene()
-
     async with ctx_write_lock(req.args.id):
+        can_modify_scene()
+
         if not req.args.force and {proj.name async for proj in projects_using_object(glob.SCENE.id, req.args.id)}:
             raise Arcor2Exception("Can't remove object that is used in project(s).")
 
@@ -337,63 +340,64 @@ async def update_object_pose_using_robot_cb(req: srpc.o.UpdateObjectPoseUsingRob
 
     assert glob.SCENE
 
-    ensure_scene_started()
+    with ctx_write_lock([req.args.robot.robot_id, req.args.id]):
+        ensure_scene_started()
 
-    if req.args.id == req.args.robot.robot_id:
-        raise Arcor2Exception("Robot cannot update its own pose.")
+        if req.args.id == req.args.robot.robot_id:
+            raise Arcor2Exception("Robot cannot update its own pose.")
 
-    scene_object = glob.SCENE.object(req.args.id)
+        scene_object = glob.SCENE.object(req.args.id)
 
-    obj_type = glob.OBJECT_TYPES[scene_object.type]
+        obj_type = glob.OBJECT_TYPES[scene_object.type]
 
-    if not obj_type.meta.has_pose:
-        raise Arcor2Exception("Object without pose.")
+        if not obj_type.meta.has_pose:
+            raise Arcor2Exception("Object without pose.")
 
-    object_model = obj_type.meta.object_model
+        object_model = obj_type.meta.object_model
 
-    if object_model:
-        collision_model = object_model.model()
-        if isinstance(collision_model, object_type.Mesh) and req.args.pivot != req.args.PivotEnum.MIDDLE:
-            raise Arcor2Exception("Only middle pivot point is supported for objects with mesh collision model.")
-    elif req.args.pivot != req.args.PivotEnum.MIDDLE:
-        raise Arcor2Exception("Only middle pivot point is supported for objects without collision model.")
+        if object_model:
+            collision_model = object_model.model()
+            if isinstance(collision_model, object_type.Mesh) and req.args.pivot != req.args.PivotEnum.MIDDLE:
+                raise Arcor2Exception("Only middle pivot point is supported for objects with mesh collision model.")
+        elif req.args.pivot != req.args.PivotEnum.MIDDLE:
+            raise Arcor2Exception("Only middle pivot point is supported for objects without collision model.")
 
-    new_pose = await get_end_effector_pose(req.args.robot.robot_id, req.args.robot.end_effector)
+        new_pose = await get_end_effector_pose(req.args.robot.robot_id, req.args.robot.end_effector)
 
-    position_delta = common.Position()
+        position_delta = common.Position()
 
-    if object_model:
-        collision_model = object_model.model()
-        if isinstance(collision_model, object_type.Box):
-            if req.args.pivot == req.args.PivotEnum.TOP:
-                position_delta.z -= collision_model.size_z / 2
-            elif req.args.pivot == req.args.PivotEnum.BOTTOM:
-                position_delta.z += collision_model.size_z / 2
-        elif isinstance(collision_model, object_type.Cylinder):
-            if req.args.pivot == req.args.PivotEnum.TOP:
-                position_delta.z -= collision_model.height / 2
-            elif req.args.pivot == req.args.PivotEnum.BOTTOM:
-                position_delta.z += collision_model.height / 2
-        elif isinstance(collision_model, object_type.Sphere):
-            if req.args.pivot == req.args.PivotEnum.TOP:
-                position_delta.z -= collision_model.radius / 2
-            elif req.args.pivot == req.args.PivotEnum.BOTTOM:
-                position_delta.z += collision_model.radius / 2
+        if object_model:
+            collision_model = object_model.model()
+            if isinstance(collision_model, object_type.Box):
+                if req.args.pivot == req.args.PivotEnum.TOP:
+                    position_delta.z -= collision_model.size_z / 2
+                elif req.args.pivot == req.args.PivotEnum.BOTTOM:
+                    position_delta.z += collision_model.size_z / 2
+            elif isinstance(collision_model, object_type.Cylinder):
+                if req.args.pivot == req.args.PivotEnum.TOP:
+                    position_delta.z -= collision_model.height / 2
+                elif req.args.pivot == req.args.PivotEnum.BOTTOM:
+                    position_delta.z += collision_model.height / 2
+            elif isinstance(collision_model, object_type.Sphere):
+                if req.args.pivot == req.args.PivotEnum.TOP:
+                    position_delta.z -= collision_model.radius / 2
+                elif req.args.pivot == req.args.PivotEnum.BOTTOM:
+                    position_delta.z += collision_model.radius / 2
 
-    position_delta = position_delta.rotated(new_pose.orientation)
+        position_delta = position_delta.rotated(new_pose.orientation)
 
-    assert scene_object.pose
+        assert scene_object.pose
 
-    scene_object.pose.position.x = new_pose.position.x - position_delta.x
-    scene_object.pose.position.y = new_pose.position.y - position_delta.y
-    scene_object.pose.position.z = new_pose.position.z - position_delta.z
+        scene_object.pose.position.x = new_pose.position.x - position_delta.x
+        scene_object.pose.position.y = new_pose.position.y - position_delta.y
+        scene_object.pose.position.z = new_pose.position.z - position_delta.z
 
-    scene_object.pose.orientation.set_from_quaternion(
-        new_pose.orientation.as_quaternion() * quaternion.quaternion(0, 1, 0, 0)
-    )
+        scene_object.pose.orientation.set_from_quaternion(
+            new_pose.orientation.as_quaternion() * quaternion.quaternion(0, 1, 0, 0)
+        )
 
-    asyncio.ensure_future(update_scene_object_pose(scene_object))
-    return None
+        asyncio.ensure_future(update_scene_object_pose(scene_object))
+        return None
 
 
 @scene_needed
@@ -404,11 +408,10 @@ async def update_object_pose_cb(req: srpc.s.UpdateObjectPose.Request, ui: WsClie
 
     assert glob.SCENE
     assert glob.LOCK
-    assert glob.LOCK.is_write_locked(req.args.object_id)
 
     obj = glob.SCENE.object(req.args.object_id)
 
-    if not await glob.LOCK.is_write_locked(obj.id):
+    if not await glob.LOCK.is_write_locked(obj.id, ''):
         raise Arcor2Exception("Object not locked.")
 
     if not obj.pose:
@@ -427,9 +430,11 @@ async def rename_object_cb(req: srpc.s.RenameObject.Request, ui: WsClient) -> No
 
     assert glob.SCENE
     assert glob.LOCK
-    assert glob.LOCK.is_read_locked(req.args.id)
 
     target_obj = glob.SCENE.object(req.args.id)
+
+    if not await glob.LOCK.is_write_locked(target_obj.id, ''):
+        raise Arcor2Exception("Object not locked.")
 
     if target_obj.name == req.args.new_name:
         return
@@ -443,8 +448,7 @@ async def rename_object_cb(req: srpc.s.RenameObject.Request, ui: WsClient) -> No
     if req.dry_run:
         return None
 
-    async with ctx_write_lock(target_obj.id):
-        target_obj.name = req.args.new_name
+    target_obj.name = req.args.new_name
 
     glob.SCENE.update_modified()
 
@@ -456,7 +460,8 @@ async def rename_object_cb(req: srpc.s.RenameObject.Request, ui: WsClient) -> No
 
 async def rename_scene_cb(req: srpc.s.RenameScene.Request, ui: WsClient) -> None:
 
-    assert glob.LOCK.is_read_locked(req.args.id)
+    if not await glob.LOCK.is_read_locked(req.args.id, ''):
+        raise Arcor2Exception("Object not locked.")
 
     unique_name(req.args.new_name, (await scene_names()))
 
@@ -476,49 +481,54 @@ async def rename_scene_cb(req: srpc.s.RenameScene.Request, ui: WsClient) -> None
 @no_scene
 async def delete_scene_cb(req: srpc.s.DeleteScene.Request, ui: WsClient) -> Optional[srpc.s.DeleteScene.Response]:
 
-    assoc_projects = await associated_projects(req.args.id)
+    async with ctx_write_lock(req.args.id):
+        # TODO raise if scene doesn't exist
 
-    if assoc_projects:
-        resp = srpc.s.DeleteScene.Response(result=False)
-        resp.messages = ["Scene has associated projects."]
-        resp.data = assoc_projects
-        return resp
+        assoc_projects = await associated_projects(req.args.id)
 
-    if req.dry_run:
+        if assoc_projects:
+            resp = srpc.s.DeleteScene.Response(result=False)
+            resp.messages = ["Scene has associated projects."]
+            resp.data = assoc_projects
+            return resp
+
+        if req.dry_run:
+            return None
+
+        scene = UpdateableCachedScene(await storage.get_scene(req.args.id))
+        await storage.delete_scene(req.args.id)
+        evt = sevts.s.SceneChanged(scene.bare)
+        evt.change_type = Event.Type.REMOVE
+        asyncio.ensure_future(notif.broadcast_event(evt))
         return None
-
-    scene = UpdateableCachedScene(await storage.get_scene(req.args.id))
-    await storage.delete_scene(req.args.id)
-    evt = sevts.s.SceneChanged(scene.bare)
-    evt.change_type = Event.Type.REMOVE
-    asyncio.ensure_future(notif.broadcast_event(evt))
-    return None
 
 
 async def projects_with_scene_cb(
     req: srpc.s.ProjectsWithScene.Request, ui: WsClient
 ) -> srpc.s.ProjectsWithScene.Response:
 
-    resp = srpc.s.ProjectsWithScene.Response()
-    resp.data = await associated_projects(req.args.id)
-    return resp
+    with ctx_read_lock(req.args.id):
+        resp = srpc.s.ProjectsWithScene.Response()
+        resp.data = await associated_projects(req.args.id)
+        return resp
 
 
 async def update_scene_description_cb(req: srpc.s.UpdateSceneDescription.Request, ui: WsClient) -> None:
 
-    async with managed_scene(req.args.scene_id) as scene:
-        scene.desc = req.args.new_description
-        scene.update_modified()
+    async with ctx_write_lock(req.args.scene_id):
+        async with managed_scene(req.args.scene_id) as scene:
+            scene.desc = req.args.new_description
+            scene.update_modified()
 
-        evt = sevts.s.SceneChanged(scene.bare)
-        evt.change_type = Event.Type.UPDATE_BASE
-        asyncio.ensure_future(notif.broadcast_event(evt))
-    return None
+            evt = sevts.s.SceneChanged(scene.bare)
+            evt.change_type = Event.Type.UPDATE_BASE
+            asyncio.ensure_future(notif.broadcast_event(evt))
+        return None
 
 
 async def copy_scene_cb(req: srpc.s.CopyScene.Request, ui: WsClient) -> None:
 
-    async with ctx_write_lock(req.args.source_id, ''):
+    async with ctx_write_lock(req.args.source_id):
         # TODO check if target_name is unique
         async with managed_scene(req.args.source_id, make_copy=True) as scene:
             scene.name = req.args.target_name
@@ -554,16 +564,15 @@ async def marker_corners_cb(req: srpc.c.MarkersCorners.Request, ui: WsClient) ->
 
 async def start_scene_cb(req: srpc.s.StartScene.Request, ui: WsClient) -> None:
 
-    async with ctx_write_lock(glob.LOCK.SCENE_NAME):
-        assert not glob.SCENE
-        
-        if get_scene_state() != sevts.s.SceneState.Data.StateEnum.Stopped:
-            raise Arcor2Exception("Scene not stopped.")
+    assert not glob.SCENE
 
-        if req.dry_run:
-            return
+    if get_scene_state() != sevts.s.SceneState.Data.StateEnum.Stopped:
+        raise Arcor2Exception("Scene not stopped.")
 
-        asyncio.ensure_future(start_scene())
+    if req.dry_run:
+        return
+
+    asyncio.ensure_future(start_scene())
 
 
 async def stop_scene_cb(req: srpc.s.StopScene.Request, ui: WsClient) -> None:

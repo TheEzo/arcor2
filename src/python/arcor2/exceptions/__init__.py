@@ -6,3 +6,11 @@ class Arcor2Exception(Exception):
 
 class Arcor2NotImplemented(Arcor2Exception):
     pass
+
+
+class CannotUnlock(Arcor2Exception):
+    pass
+
+
+class CannotLock(Arcor2Exception):
+    pass

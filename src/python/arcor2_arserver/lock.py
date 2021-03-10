@@ -2,8 +2,8 @@ import asyncio
 from datetime import datetime
 from typing import Optional, Dict, AsyncGenerator
 
-from arcor2.cached import UpdateableCachedProject
-from arcor2.cached import UpdateableCachedScene
+from arcor2.cached import UpdateableCachedProject, UpdateableCachedScene
+from arcor2.exceptions import CannotUnlock
 
 
 class Lock:
@@ -13,10 +13,10 @@ class Lock:
     PROJECT_NAME = "PROJECT"
 
     class Data:
-        __slots__ = "owner", "timestamp", "count"
+        __slots__ = "owners", "timestamp", "count"
 
         def __init__(self, owner):
-            self.owner = owner
+            self.owners = [owner]
             self.timestamp = datetime.now()
             self.count = 1
 
@@ -36,6 +36,7 @@ class Lock:
             # object id: data
             self.read: Dict[str, "Lock.Data"] = {}
             self.write: Dict[str, "Lock.Data"] = {}
+
             self.tree: bool = False
 
         def read_lock(self, obj_id: str, owner: str) -> bool:
@@ -47,21 +48,26 @@ class Lock:
                 return False
 
             already_locked = obj_id in self.read
-            if already_locked and self.read[obj_id].owner != owner:
-                return False
-
             if already_locked:
+                self.read[obj_id].owners.append(owner)
                 self.read[obj_id].inc_count()
             else:
                 self.read[obj_id] = Lock.Data(owner)
+            return True
 
-        def read_unlock(self, obj_id: str) -> bool:
+        def read_unlock(self, obj_id: str, owner: str) -> bool:
 
             if obj_id not in self.read:
-                return False
+                raise CannotUnlock(f"Object is not read locked by '{owner}'")
 
             if self.read[obj_id].count > 1:
-                self.read[obj_id].dec_count()
+                lock_data = self.read[obj_id]
+                try:
+                    lock_data.owners.remove(owner)
+                except ValueError:
+                    raise CannotUnlock(f"'{owner}' does not own read lock for object '{obj_id}'")
+
+                lock_data.dec_count()
             else:
                 del self.read[obj_id]
 
@@ -69,37 +75,26 @@ class Lock:
 
         def write_lock(self, obj_id: str, owner: str, lock_tree: bool) -> bool:
 
-            if self.tree:
+            # TODO maybe exception would be better?
+            if self.tree or obj_id in self.write or obj_id in self.read:
                 return False
 
-            already_locked = obj_id in self.write
-            if already_locked and self.write[obj_id].owner != owner:
+            if lock_tree and (self.read or self.write):
                 return False
 
-            any_r_lock = next((True for r_lock in self.read.values() if r_lock.owner != owner), False)
-
-            if lock_tree:
-                any_w_lock = next((True for w_lock in self.write.values() if w_lock.owner != owner), False)
-                if any_r_lock or any_w_lock:
-                    return False
-            else:
-                if any_r_lock or obj_id in self.write:
-                    return False
-
-            if already_locked:
-                self.write[obj_id].inc_count()
-            else:
-                self.write[obj_id] = Lock.Data(owner)
+            self.write[obj_id] = Lock.Data(owner)
             self.tree = lock_tree
             return True
 
-        def write_unlock(self, obj_id: str) -> bool:
+        def write_unlock(self, obj_id: str, owner: str) -> bool:
 
             if obj_id not in self.write:
-                return False
+                raise CannotUnlock(f"Object is not write locked by '{owner}'")
 
-            self.write = None
-            self.tree = False
+            if self.tree:
+                self.tree = False
+            del self.write[obj_id]
+
             return True
 
         def is_empty(self) -> bool:
@@ -107,13 +102,11 @@ class Lock:
             return not self.read and not self.write
 
     def __init__(self):
-        self.scene = None
-        self.project = None
+        self._scene = None
+        self._project = None
 
         self._lock = asyncio.Lock()
         self._locked_objects: Dict[str, "Lock.LockedObject"] = {}
-        # obj_id: root_id TODO handle this as property?
-        self._used: Dict[str, str] = {}
 
     @property
     def scene(self):
@@ -150,13 +143,13 @@ class Lock:
 
         return locked
 
-    async def read_unlock(self, obj_id: str) -> bool:
+    async def read_unlock(self, obj_id: str, owner: str) -> bool:
 
         root_id = self.get_root_id(obj_id)
 
         async with self._lock:
             lock_record = self._get_lock_record(root_id)
-            unlocked = lock_record.read_unlock(obj_id)
+            unlocked = lock_record.read_unlock(obj_id, owner)
 
             if unlocked and lock_record.is_empty():
                 del self._locked_objects[root_id]
@@ -176,43 +169,51 @@ class Lock:
 
         return locked
 
-    async def write_unlock(self, obj_id: str) -> bool:
+    async def write_unlock(self, obj_id: str, owner: str) -> bool:
 
         root_id = self.get_root_id(obj_id)
 
         async with self._lock:
             lock_record = self._get_lock_record(root_id)
-            unlocked = lock_record.write_unlock(obj_id)
+            unlocked = lock_record.write_unlock(obj_id, owner)
 
             if unlocked and lock_record.is_empty():
                 del self._locked_objects[root_id]
 
         return unlocked
 
-    async def is_write_locked(self, obj_id: str) -> bool:
+    async def is_write_locked(self, obj_id: str, owner: str) -> bool:
 
         root_id = self.get_root_id(obj_id)
 
         async with self._lock:
-            return root_id in self._locked_objects and obj_id in self._locked_objects[root_id].write
+            lock_record = self._locked_objects.get(root_id)
+            if not lock_record:
+                return False
 
-    async def is_read_locked(self, obj_id: str) -> bool:
+            return obj_id in lock_record.write and owner in lock_record.write[obj_id].owners
+
+    async def is_read_locked(self, obj_id: str, owner: str) -> bool:
 
         root_id = self.get_root_id(obj_id)
 
         async with self._lock:
-            return root_id in self._locked_objects and obj_id in self._locked_objects[root_id].read
+            lock_record = self._locked_objects.get(root_id)
+            if not lock_record:
+                return False
+
+            return obj_id in lock_record.read and owner in lock_record.read[obj_id].owners
 
     async def get_locked_roots_count(self) -> int:
 
         async with self._lock:
-            return bool(self._locked_objects)
+            return len(self._locked_objects)
 
     def get_root_id(self, obj_id):
         """Retrieve root object id for given object"""
 
         if self.scene:
-            # TODO scene object hierarchy
+            # TODO support scene object hierarchy
             return obj_id
 
         elif self.project:
@@ -226,7 +227,7 @@ class Lock:
             raise KeyError(f"Unknown object '{obj_id}'")
 
     def _get_lock_record(self, root_id: str) -> "Lock.LockedObject":
-        """Create or retrieve lock record for root_id"""
+        """Create and/or retrieve lock record for root_id"""
 
         assert self._lock.locked()
 

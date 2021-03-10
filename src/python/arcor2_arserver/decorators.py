@@ -1,4 +1,5 @@
 import functools
+from asyncio import sleep
 from typing import Any, Callable, Coroutine, TypeVar, cast
 
 from arcor2.exceptions import Arcor2Exception
@@ -48,3 +49,38 @@ def project_needed(coro: F) -> F:
         return await coro(*args, **kwargs)
 
     return cast(F, async_wrapper)
+
+
+def retry(exc=Exception, tries: int = 1, delay: float = 0):
+    """
+    Retry decorator
+    :param exc: Exception or tuple of exceptions to catch
+    :param tries: number of attempts
+    :param delay: delay between attempts
+    """
+
+    def _retry(coro: F) -> F:
+        @functools.wraps(coro)
+        async def async_wrapper(*fargs, **fkwargs) -> Any:
+            return await _retry_call(exc, tries, delay, coro, *fargs, **fkwargs)
+
+        return cast(coro, async_wrapper)
+
+    return _retry
+
+
+async def _retry_call(exc: Exception, tries: int, delay: float, coro: F, *args, **kwargs):
+    """
+    Internal part of retry decorator
+    - handles exceptions, delay and tries
+    """
+    while tries:
+        try:
+            return await coro(*args, **kwargs)
+        except exc:
+            tries -= 1
+            if tries == 0:
+                raise
+
+            if delay > 0:
+                await sleep(delay)
